@@ -636,7 +636,7 @@ pub const Socket = struct {
     /// Wait the socket until it is ready to read. If exit function is given,
     /// this execute the function and exit from this function if the exit function
     /// return error.
-    pub fn waitToRead(self: Socket, exit_fn: ?fn () anyerror!void) anyerror!void {
+    pub fn waitToRead(self: Socket, exit_fn: ?*const fn () anyerror!void) anyerror!void {
         if (self.fd) |fd| {
             while (readyToRead(fd, 0)) |ready| {
                 if (exit_fn) |exit|
@@ -654,7 +654,7 @@ pub const Socket = struct {
     /// Wait the socket until it is ready to write. If exit function is given,
     /// this execute the function and exit from this function if the exit function
     /// return error.
-    pub fn waitToWrite(self: Socket, exit_fn: ?fn () anyerror!void) anyerror!void {
+    pub fn waitToWrite(self: Socket, exit_fn: ?*const fn () anyerror!void) anyerror!void {
         if (self.fd) |fd| {
             while (readyToWrite(fd, 0)) |ready| {
                 if (exit_fn) |exit|
