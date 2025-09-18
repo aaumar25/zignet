@@ -1,7 +1,7 @@
 .{
     .name = .zignet,
     .version = "0.0.1",
-    .fingerprint = 0x608487bc9ce3bf24,
+    .fingerprint = 0x2403996fafbe0b04,
     .minimum_zig_version = "0.15.1",
     .paths = .{
         "build.zig",
