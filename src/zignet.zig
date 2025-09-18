@@ -643,10 +643,7 @@ pub const Socket = struct {
             if (exit_fn) |exit|
                 exit() catch |e| return e;
             if (ready) return;
-        } else |e| {
-            try self.close();
-            return e;
-        }
+        } else |e| return e;
     }
 
     // TODO: If zig support adding declaration in comptime, move this function
@@ -659,10 +656,7 @@ pub const Socket = struct {
             if (exit_fn) |exit|
                 exit() catch |e| return e;
             if (ready) return;
-        } else |e| {
-            try self.close();
-            return e;
-        }
+        } else |e| return e;
     }
 
     // TODO: If zig support adding declaration in comptime, move this function
