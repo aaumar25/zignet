@@ -2,13 +2,13 @@ const Network = @This();
 const std = @import("std");
 const builtin = @import("builtin");
 
-const AddressFamily = enum { ipv4, ipv6 };
-
-const SockAddr = union(AddressFamily) {
+const SockAddr = union(enum) {
     any: std.posix.sockaddr,
     ipv4: std.posix.sockaddr.in,
     ipv6: std.posix.sockaddr.in6,
 };
+
+const AddressFamily = enum { ipv4, ipv6 };
 
 /// A network address abstraction. Contains one member for each possible type of address.
 pub const Address = union(AddressFamily) {
