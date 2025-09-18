@@ -298,6 +298,7 @@ pub const Endpoint = struct {
                 },
                 .port = std.mem.bigToNative(u16, sockaddr.port),
             },
+            .any => unreachable,
         };
     }
 
@@ -544,6 +545,7 @@ pub const Socket = struct {
                     in6,
                     @sizeOf(@TypeOf(in6)),
                 },
+                .any => unreachable,
             };
         // NOTE: Instead of providing protocol TCP, we use 0 since using protocol
         //       TCP does not allow to connect with hostname.
@@ -564,7 +566,7 @@ pub const Socket = struct {
         allocator: std.mem.Allocator,
         name: []const u8,
         port: u16,
-    ) (Endpoint.Error || std.posix.ConnectError)!Socket {
+    ) !Socket {
         const list = try std.net.getAddressList(allocator, name, port);
         defer list.deinit();
 
@@ -637,16 +639,14 @@ pub const Socket = struct {
     /// this execute the function and exit from this function if the exit function
     /// return error.
     pub fn waitToRead(self: Socket, exit_fn: ?*const fn () anyerror!void) anyerror!void {
-        if (self.fd) |fd| {
-            while (readyToRead(fd, 0)) |ready| {
-                if (exit_fn) |exit|
-                    exit() catch |e| return e;
-                if (ready) return;
-            } else |e| {
-                try self.close();
-                return e;
-            }
-        } else return error.ConnectionNotEstablished;
+        while (readyToRead(self.fd, 0)) |ready| {
+            if (exit_fn) |exit|
+                exit() catch |e| return e;
+            if (ready) return;
+        } else |e| {
+            try self.close();
+            return e;
+        }
     }
 
     // TODO: If zig support adding declaration in comptime, move this function
@@ -655,16 +655,14 @@ pub const Socket = struct {
     /// this execute the function and exit from this function if the exit function
     /// return error.
     pub fn waitToWrite(self: Socket, exit_fn: ?*const fn () anyerror!void) anyerror!void {
-        if (self.fd) |fd| {
-            while (readyToWrite(fd, 0)) |ready| {
-                if (exit_fn) |exit|
-                    exit() catch |e| return e;
-                if (ready) return;
-            } else |e| {
-                try self.close();
-                return e;
-            }
-        } else return error.ConnectionNotEstablished;
+        while (readyToWrite(self.fd, 0)) |ready| {
+            if (exit_fn) |exit|
+                exit() catch |e| return e;
+            if (ready) return;
+        } else |e| {
+            try self.close();
+            return e;
+        }
     }
 
     // TODO: If zig support adding declaration in comptime, move this function
