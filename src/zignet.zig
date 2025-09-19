@@ -519,7 +519,7 @@ pub const Socket = struct {
     }
 
     /// Connect to a server by endpoint.
-    pub fn connect(endpoint: Endpoint) std.posix.ConnectError!Socket {
+    pub fn connect(endpoint: Endpoint) (std.posix.ConnectError || std.posix.SocketError)!Socket {
         const sockaddr = endpoint.toSockAddr();
         const sockaddr_ptr: *const std.posix.sockaddr = switch (sockaddr) {
             .ipv4 => |in| @ptrCast(&in),
@@ -551,9 +551,7 @@ pub const Socket = struct {
 
         if (list.addrs.len == 0) return error.UnknownHostName;
         for (list.addrs) |addr| {
-            const endpoint = try Endpoint.fromSockAddr(
-                .{ .any = addr.any },
-            );
+            const endpoint = try Endpoint.fromSockAddr(&addr.any);
             return Socket.connect(endpoint) catch |err| switch (err) {
                 std.posix.ConnectError.ConnectionRefused => continue,
                 else => return err,
