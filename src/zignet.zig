@@ -269,37 +269,31 @@ pub const Endpoint = struct {
         }
     }
 
-    pub fn fromSockAddr(addr: SockAddr) Error!Endpoint {
-        const sock_addr: SockAddr = switch (addr) {
-            .any => |any| b: {
-                if (addr.family == std.posix.AF.INET)
-                    break :b .{ .ipv4 = @ptrCast(@alignCast(any)) }
-                else if (addr.family == std.posix.AF.INET6)
-                    break :b .{ .ipv6 = @ptrCast(@alignCast(any)) }
-                else
-                    return error.UnsupportedFamily;
-            },
-            inline .ipv4, .ipv6 => addr,
-        };
-        return switch (sock_addr) {
-            .ipv4 => |sockaddr| .{
+    pub fn fromSockAddr(sockaddr: *const std.posix.sockaddr) Error!Endpoint {
+        if (sockaddr.family == std.posix.AF.INET) {
+            const value: *align(4) const std.posix.sockaddr.in =
+                @ptrCast(@alignCast(sockaddr));
+            return .{
+                .port = std.mem.bigToNative(u16, value.port),
                 .addr = .{
                     .ipv4 = .{
-                        .value = @bitCast(sock_addr.ipv4.addr),
+                        .value = @bitCast(value.addr),
                     },
                 },
-                .port = std.mem.bigToNative(u16, sockaddr.port),
-            },
-            .ipv6 => |sockaddr| .{
+            };
+        } else if (sockaddr.family == std.posix.AF.INET6) {
+            const value: *align(4) const std.posix.sockaddr.in6 =
+                @ptrCast(@alignCast(sockaddr));
+            return .{
+                .port = std.mem.bigToNative(u16, value.port),
                 .addr = .{
                     .ipv6 = .{
-                        .value = sock_addr.ipv6.addr,
+                        .value = @bitCast(value.addr),
+                        .scope_id = value.scope_id,
                     },
                 },
-                .port = std.mem.bigToNative(u16, sockaddr.port),
-            },
-            .any => unreachable,
-        };
+            };
+        } else return Error.UnsupportedFamily;
     }
 
     pub const Error = error{UnsupportedFamily};
@@ -535,12 +529,12 @@ pub const Socket = struct {
     pub fn connect(endpoint: Endpoint) std.posix.ConnectError!Socket {
         const domain, const sockaddr, const socklen =
             switch (endpoint.toSockAddr()) {
-                .ipv4 => |in| .{
+                inline .ipv4 => |in| .{
                     in.family,
                     in,
                     @sizeOf(@TypeOf(in)),
                 },
-                .ipv6 => |in6| .{
+                inline .ipv6 => |in6| .{
                     in6.family,
                     in6,
                     @sizeOf(@TypeOf(in6)),
@@ -712,3 +706,21 @@ pub const Socket = struct {
         return poll_fd[0].revents;
     }
 };
+
+test "convert sockaddr" {
+    const ipv4: Endpoint = .{
+        .addr = .{ .ipv4 = try .parse("127.0.0.1") },
+        .port = 1000,
+    };
+    const sockaddr = ipv4.toSockAddr();
+    // TODO: Make the following declaration as a function.
+    const any: *const std.posix.sockaddr = switch (sockaddr) {
+        .ipv4 => |in| @ptrCast(&in),
+        .ipv6 => |in6| @ptrCast(&in6),
+        .any => |any| &any,
+    };
+    try std.testing.expectEqual(any.family, std.posix.AF.INET);
+    // Convert back to endpoint
+    const back = try Endpoint.fromSockAddr(any);
+    try std.testing.expectEqual(ipv4, back);
+}
