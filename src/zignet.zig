@@ -6,6 +6,14 @@ const SockAddr = union(enum) {
     any: std.posix.sockaddr,
     ipv4: std.posix.sockaddr.in,
     ipv6: std.posix.sockaddr.in6,
+
+    pub fn getSockLen(self: SockAddr) std.posix.socklen_t {
+        switch (self) {
+            .ipv4 => @sizeOf(std.posix.sockaddr.in),
+            .ipv6 => @sizeOf(std.posix.sockaddr.in6),
+            else => @compileError("UnsupportedAddressFamily"),
+        }
+    }
 };
 
 const AddressFamily = enum { ipv4, ipv6 };
@@ -513,7 +521,11 @@ pub const Socket = struct {
         );
         errdefer std.posix.close(fd);
         // Bind the socket to the specified endpoint
-        try std.posix.bind(fd, sockaddr_ptr, @sizeOf(sockaddr));
+        try std.posix.bind(
+            fd,
+            sockaddr_ptr,
+            sockaddr.getSockLen(),
+        );
         try std.posix.listen(fd, 0);
         return .{ .fd = fd, .sockaddr = sockaddr };
     }
@@ -535,7 +547,11 @@ pub const Socket = struct {
             0,
         );
         errdefer std.posix.close(fd);
-        try std.posix.connect(fd, sockaddr_ptr, @sizeOf(sockaddr_ptr));
+        try std.posix.connect(
+            fd,
+            sockaddr_ptr,
+            sockaddr.getSockLen(),
+        );
         return .{ .fd = fd, .sockaddr = sockaddr };
     }
 
