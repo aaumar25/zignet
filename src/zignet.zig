@@ -497,60 +497,45 @@ pub const Socket = struct {
     pub const Writer = std.net.Stream.Writer;
 
     pub fn listen(endpoint: Endpoint) (std.posix.SocketError || std.posix.BindError)!Socket {
-        const domain, const sockaddr, const socklen =
-            switch (endpoint.toSockAddr()) {
-                .ipv4 => |in| .{
-                    in.family,
-                    in,
-                    @sizeOf(@TypeOf(in)),
-                },
-                .ipv6 => |in6| .{
-                    in6.family,
-                    in6,
-                    @sizeOf(@TypeOf(in6)),
-                },
-            };
+        const sockaddr = endpoint.toSockAddr();
+        const sockaddr_ptr: *const std.posix.sockaddr = switch (sockaddr) {
+            .ipv4 => |in| @ptrCast(&in),
+            .ipv6 => |in6| @ptrCast(&in6),
+            .any => |any| &any,
+        };
         // NOTE: Instead of providing protocol TCP, we use 0 since using protocol
         //       TCP does not allow to connect with hostname.
         // Create a socket
         const fd = try std.posix.socket(
-            domain,
+            sockaddr_ptr.family,
             std.posix.SOCK.STREAM,
             0,
         );
         errdefer std.posix.close(fd);
         // Bind the socket to the specified endpoint
-        try std.posix.bind(fd, @ptrCast(&sockaddr), socklen);
+        try std.posix.bind(fd, sockaddr_ptr, @sizeOf(sockaddr));
         try std.posix.listen(fd, 0);
         return .{ .fd = fd, .sockaddr = sockaddr };
     }
 
     /// Connect to a server by endpoint.
     pub fn connect(endpoint: Endpoint) std.posix.ConnectError!Socket {
-        const domain, const sockaddr, const socklen =
-            switch (endpoint.toSockAddr()) {
-                inline .ipv4 => |in| .{
-                    in.family,
-                    in,
-                    @sizeOf(@TypeOf(in)),
-                },
-                inline .ipv6 => |in6| .{
-                    in6.family,
-                    in6,
-                    @sizeOf(@TypeOf(in6)),
-                },
-                .any => unreachable,
-            };
+        const sockaddr = endpoint.toSockAddr();
+        const sockaddr_ptr: *const std.posix.sockaddr = switch (sockaddr) {
+            .ipv4 => |in| @ptrCast(&in),
+            .ipv6 => |in6| @ptrCast(&in6),
+            .any => |any| &any,
+        };
         // NOTE: Instead of providing protocol TCP, we use 0 since using protocol
         //       TCP does not allow to connect with hostname.
         // Create a socket
         const fd = try std.posix.socket(
-            domain,
+            sockaddr_ptr.family,
             std.posix.SOCK.STREAM,
             0,
         );
         errdefer std.posix.close(fd);
-        try std.posix.connect(fd, @ptrCast(&sockaddr), socklen);
+        try std.posix.connect(fd, sockaddr_ptr, @sizeOf(sockaddr_ptr));
         return .{ .fd = fd, .sockaddr = sockaddr };
     }
 
