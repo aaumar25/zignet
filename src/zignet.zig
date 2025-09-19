@@ -6,14 +6,6 @@ const SockAddr = union(enum) {
     any: std.posix.sockaddr,
     ipv4: std.posix.sockaddr.in,
     ipv6: std.posix.sockaddr.in6,
-
-    pub fn getSockLen(self: SockAddr) std.posix.socklen_t {
-        switch (self) {
-            .ipv4 => @sizeOf(std.posix.sockaddr.in),
-            .ipv6 => @sizeOf(std.posix.sockaddr.in6),
-            else => @compileError("UnsupportedAddressFamily"),
-        }
-    }
 };
 
 const AddressFamily = enum { ipv4, ipv6 };
@@ -506,11 +498,12 @@ pub const Socket = struct {
 
     pub fn listen(endpoint: Endpoint) (std.posix.SocketError || std.posix.BindError)!Socket {
         const sockaddr = endpoint.toSockAddr();
-        const sockaddr_ptr: *const std.posix.sockaddr = switch (sockaddr) {
-            .ipv4 => |in| @ptrCast(&in),
-            .ipv6 => |in6| @ptrCast(&in6),
-            .any => |any| &any,
-        };
+        const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix.socklen_t =
+            switch (sockaddr) {
+                .ipv4 => |in| .{ @ptrCast(&in), @sizeOf(@TypeOf(in)) },
+                .ipv6 => |in6| .{ @ptrCast(&in6), @sizeOf(@TypeOf(in6)) },
+                .any => |any| .{ &any, @sizeOf(@TypeOf(any)) },
+            };
         // NOTE: Instead of providing protocol TCP, we use 0 since using protocol
         //       TCP does not allow to connect with hostname.
         // Create a socket
@@ -521,11 +514,7 @@ pub const Socket = struct {
         );
         errdefer std.posix.close(fd);
         // Bind the socket to the specified endpoint
-        try std.posix.bind(
-            fd,
-            sockaddr_ptr,
-            sockaddr.getSockLen(),
-        );
+        try std.posix.bind(fd, sockaddr_ptr, socklen);
         try std.posix.listen(fd, 0);
         return .{ .fd = fd, .sockaddr = sockaddr };
     }
@@ -533,25 +522,22 @@ pub const Socket = struct {
     /// Connect to a server by endpoint.
     pub fn connect(endpoint: Endpoint) (std.posix.ConnectError || std.posix.SocketError)!Socket {
         const sockaddr = endpoint.toSockAddr();
-        const sockaddr_ptr: *const std.posix.sockaddr = switch (sockaddr) {
-            .ipv4 => |in| @ptrCast(&in),
-            .ipv6 => |in6| @ptrCast(&in6),
-            .any => |any| &any,
-        };
+        const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix.socklen_t =
+            switch (sockaddr) {
+                .ipv4 => |in| .{ @ptrCast(&in), @sizeOf(@TypeOf(in)) },
+                .ipv6 => |in6| .{ @ptrCast(&in6), @sizeOf(@TypeOf(in6)) },
+                .any => |any| .{ &any, @sizeOf(@TypeOf(any)) },
+            };
         // NOTE: Instead of providing protocol TCP, we use 0 since using protocol
         //       TCP does not allow to connect with hostname.
         // Create a socket
         const fd = try std.posix.socket(
             sockaddr_ptr.family,
             std.posix.SOCK.STREAM,
-            0,
+            std.posix.IPPROTO.TCP,
         );
         errdefer std.posix.close(fd);
-        try std.posix.connect(
-            fd,
-            sockaddr_ptr,
-            sockaddr.getSockLen(),
-        );
+        try std.posix.connect(fd, sockaddr_ptr, socklen);
         return .{ .fd = fd, .sockaddr = sockaddr };
     }
 
@@ -566,14 +552,33 @@ pub const Socket = struct {
         defer list.deinit();
 
         if (list.addrs.len == 0) return error.UnknownHostName;
+        var err: std.posix.ConnectError = undefined;
         for (list.addrs) |addr| {
             const endpoint = try Endpoint.fromSockAddr(&addr.any);
-            return Socket.connect(endpoint) catch |err| switch (err) {
-                std.posix.ConnectError.ConnectionRefused => continue,
-                else => return err,
+            return Socket.connect(endpoint) catch |e| {
+                switch (e) {
+                    // These 3 errors are allowed to attempt reconnect by
+                    // windows. With that allowance, instead of returning error,
+                    // continue the next endpoint.
+                    // see: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-connect
+                    std.posix.ConnectError.ConnectionRefused => {
+                        err = std.posix.ConnectError.ConnectionRefused;
+                        continue;
+                    },
+                    std.posix.ConnectError.ConnectionTimedOut => {
+                        err = std.posix.ConnectError.ConnectionTimedOut;
+                        continue;
+                    },
+                    std.posix.ConnectError.NetworkUnreachable => {
+                        err = std.posix.ConnectError.NetworkUnreachable;
+                        continue;
+                    },
+                    else => return e,
+                }
             };
         }
-        return std.posix.ConnectError.ConnectionRefused;
+        // Return the latest `ConnectError` catched from the last endpoint.
+        return err;
     }
 
     pub fn close(self: Socket) void {
