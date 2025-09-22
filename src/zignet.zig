@@ -660,7 +660,7 @@ pub const Socket = struct {
     // TODO: If zig support adding declaration in comptime, move this function
     //       to the Reader.
     /// Check if the socket is ready to read.
-    fn readyToRead(
+    pub fn readyToRead(
         fd: std.posix.socket_t,
         /// Time, in milliseconds, to wait. 0 return immediately. <0 blocking.
         timeout: i32,
@@ -675,7 +675,7 @@ pub const Socket = struct {
     // TODO: If zig support adding declaration in comptime, move this function
     //       to the Writer.
     /// Check if the socket is ready to write.
-    fn readyToWrite(
+    pub fn readyToWrite(
         fd: std.posix.socket_t,
         /// Time, in milliseconds, to wait. 0 return immediately. <0 blocking.
         timeout: i32,
