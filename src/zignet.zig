@@ -20,7 +20,7 @@ pub const Address = union(AddressFamily) {
         InvalidFormat,
     };
 
-    pub fn parse(string: []const u8) Error.InvalidFormat!Address {
+    pub fn parse(string: []const u8) Error!Address {
         return if (Address.IPv4.parse(string)) |ip|
             Address{ .ipv4 = ip }
         else |_| if (Address.IPv6.parse(string)) |ip|
@@ -128,7 +128,7 @@ pub const Address = union(AddressFamily) {
         /// [RFC6874](https://datatracker.ietf.org/doc/html/rfc6874) is highly
         /// platform-specific and difficult to validate.
         /// (See https://www.w3.org/Bugs/Public/show_bug.cgi?id=27234#c2).
-        pub fn parse(string: []const u8) Error.InvalidFormat!IPv6 {
+        pub fn parse(string: []const u8) (Error || std.fmt.ParseIntError)!IPv6 {
             if (string.len < 2 or string.len > 39) {
                 return error.InvalidFormat;
             }
@@ -308,10 +308,7 @@ pub const Socket = struct {
     fd: std.posix.socket_t,
     sockaddr: SockAddr,
 
-    pub const Error = error{
-        UnsupportedFamily,
-        ConnectionClosedByPeer,
-    };
+    pub const Error = error{ConnectionClosedByPeer};
 
     pub const Reader = switch (builtin.os.tag) {
         .windows => struct {
@@ -496,7 +493,8 @@ pub const Socket = struct {
     };
     pub const Writer = std.net.Stream.Writer;
 
-    pub fn listen(endpoint: Endpoint) (std.posix.SocketError || std.posix.BindError)!Socket {
+    pub fn listen(endpoint: Endpoint) (std.posix.SocketError ||
+        std.posix.BindError || std.posix.ListenError)!Socket {
         const sockaddr = endpoint.toSockAddr();
         const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix.socklen_t =
             switch (sockaddr) {
@@ -585,30 +583,17 @@ pub const Socket = struct {
         std.posix.close(self.fd);
     }
 
-    pub fn accept(self: Socket) (Error || std.posix.AcceptError)!Socket {
-        // var addr: std.posix.sockaddr.in6 = undefined;
-        // var addr_size: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in6);
-
-        // const flags = 0;
-
-        var addr: std.posix.sockaddr = undefined;
+    pub fn accept(self: Socket) std.posix.AcceptError!Socket {
+        var accepted_addr: SockAddr = .{ .any = undefined };
         var addr_size: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
         const fd = try std.posix.accept(
-            self.internal,
-            &addr,
+            self.fd,
+            &accepted_addr.any,
             &addr_size,
             0,
         );
 
-        return Socket{
-            .fd = fd,
-            .sockaddr = if (addr.family == std.posix.AF.INET)
-                .{ .ipv4 = @ptrCast(@alignCast(addr)) }
-            else if (addr.family == std.posix.AF.INET6)
-                .{ .ipv6 = @ptrCast(@alignCast(addr)) }
-            else
-                return error.UnsupportedFamily,
-        };
+        return Socket{ .fd = fd, .sockaddr = accepted_addr };
     }
 
     /// Return `Socket.Reader`. Use `Socket.Reader.Interface` as the interface
