@@ -550,27 +550,63 @@ pub const Socket = struct {
             .{ .fd = fd, .sockaddr = sockaddr, .exit_fn = exit_fn };
         std.posix.connect(fd, sockaddr_ptr, socklen) catch |e| switch (e) {
             std.posix.ConnectError.WouldBlock => {
-                // Wait until the sockeet is ready to write.
+                // Wait until the socket is ready to write.
                 try socket.waitToWrite();
-                // Check whether the connect has completed successfully.
-                // source:
-                // https://man7.org/linux/man-pages/man2/connect.2.html
-                // https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-connect
                 var opt: [@sizeOf(u32)]u8 = undefined;
-                try std.posix.getsockopt(
-                    socket.fd,
-                    std.posix.SOL.SOCKET,
-                    std.posix.SO.ERROR,
-                    &opt,
-                );
-                // Reset the socket mode back to blocking
+                var len: i32 = @intCast(opt.len);
                 switch (builtin.os.tag) {
-                    .windows => std.os.windows.ws2_32.ioctlsocket(
-                        socket.fd,
-                        std.os.windows.ws2_32.FIONBIO,
-                        0,
-                    ),
+                    .windows => {
+                        // Check whether the connect has completed successfully.
+                        // source:
+                        // https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-connect
+                        {
+                            const res = std.os.windows.ws2_32.getsockopt(
+                                socket.fd,
+                                std.os.windows.ws2_32.SOL.SOCKET,
+                                std.os.windows.ws2_32.SO.ERROR,
+                                &opt,
+                                &len,
+                            );
+                            if (res != 0)
+                                return switch (std.os.windows.ws2_32.WSAGetLastError()) {
+                                    .WSANOTINITIALISED => error.NetworkUnitialised,
+                                    .WSAENETDOWN => error.NetworkSubsystemFailed,
+                                    .WSAEFAULT, .WSAENOPROTOOPT => error.InvalidOpt,
+                                    .WSAEINPROGRESS, .WSAENOTSOCK => unreachable,
+                                    .WSAEINVAL => error.InvalidLevel,
+                                    else => unreachable,
+                                };
+                        }
+                        // Reset the socket mode back to blocking
+                        {
+                            var ioctl_arg: u32 = 0;
+                            const res = std.os.windows.ws2_32.ioctlsocket(
+                                socket.fd,
+                                std.os.windows.ws2_32.FIONBIO,
+                                &ioctl_arg,
+                            );
+                            if (res != 0)
+                                return switch (std.os.windows.ws2_32.WSAGetLastError()) {
+                                    .WSANOTINITIALISED => error.NetworkUnitialised,
+                                    .WSAENETDOWN => error.NetworkSubsystemFailed,
+                                    .WSAEFAULT, .WSAENOPROTOOPT => error.InvalidArgument,
+                                    .WSAEINPROGRESS => error.ProgressingBlockingSocket,
+                                    .WSAENOTSOCK => unreachable,
+                                    else => unreachable,
+                                };
+                        }
+                    },
                     .linux, .macos => {
+                        // Check whether the connect has completed successfully.
+                        // source:
+                        // https://man7.org/linux/man-pages/man2/connect.2.html
+                        try std.posix.getsockopt(
+                            socket.fd,
+                            std.posix.SOL.SOCKET,
+                            std.posix.SO.ERROR,
+                            &opt,
+                        );
+                        // Reset the socket mode back to blocking
                         const flags =
                             try std.posix.fcntl(socket.fd, std.posix.F.GETFL, 0);
                         const new_flags = flags & ~@as(usize, std.posix.SOCK.NONBLOCK);
