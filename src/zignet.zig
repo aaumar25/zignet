@@ -619,7 +619,10 @@ pub const Socket = struct {
         std.posix.close(self.fd);
     }
 
-    pub fn accept(self: Socket) std.posix.AcceptError!Socket {
+    pub fn accept(
+        self: Socket,
+        exit_fn: ?*const fn () anyerror!void,
+    ) std.posix.AcceptError!Socket {
         var accepted_addr: SockAddr = .{ .any = undefined };
         var addr_size: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
         const fd = try std.posix.accept(
@@ -629,7 +632,7 @@ pub const Socket = struct {
             0,
         );
 
-        return Socket{ .fd = fd, .sockaddr = accepted_addr };
+        return .{ .fd = fd, .sockaddr = accepted_addr, .exit_fn = exit_fn };
     }
 
     /// Return `Socket.Reader`. Use `Socket.Reader.Interface` as the interface
@@ -748,4 +751,8 @@ test "convert sockaddr" {
     // Convert back to endpoint
     const back = try Endpoint.fromSockAddr(any);
     try std.testing.expectEqual(ipv4, back);
+}
+
+test {
+    std.testing.refAllDeclsRecursive(@This());
 }
