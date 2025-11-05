@@ -10,18 +10,18 @@ test {
     var writer_buf: [4096]u8 = undefined;
     var reader_buf: [4096]u8 = undefined;
 
-    const sock = try zignet.Socket.connect(endpoint);
+    const sock = try zignet.Socket.connect(endpoint, null);
     defer sock.close();
     var writer = sock.writer(&writer_buf);
     var reader = sock.reader(&reader_buf);
 
     // This call ensure that the socket is ready to write. Pass function with
     // type `fn () anyerror!void` to stop waiting the socket to be ready.
-    try sock.waitToWrite(null);
+    try sock.waitToWrite();
     try writer.interface.write("Hello, World!");
     try writer.interface.flush();
 
-    try sock.waitToRead(null);
+    try sock.waitToRead();
     while (reader.interface.takeByte()) |byte| {
         std.debug.print("{c}", .{byte});
     } else |e| {
