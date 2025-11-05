@@ -564,10 +564,21 @@ pub const Socket = struct {
                     &opt,
                 );
                 // Reset the socket mode back to blocking
-                const flags =
-                    try std.posix.fcntl(socket.fd, std.posix.F.GETFL, 0);
-                const new_flags = flags & ~@as(usize, std.posix.SOCK.NONBLOCK);
-                _ = try std.posix.fcntl(socket.fd, std.posix.F.SETFL, new_flags);
+                switch (builtin.os.tag) {
+                    .windows => std.os.windows.ws2_32.ioctlsocket(
+                        socket.fd,
+                        std.os.windows.ws2_32.FIONBIO,
+                        0,
+                    ),
+                    .linux, .macos => {
+                        const flags =
+                            try std.posix.fcntl(socket.fd, std.posix.F.GETFL, 0);
+                        const new_flags = flags & ~@as(usize, std.posix.SOCK.NONBLOCK);
+                        _ = try std.posix.fcntl(socket.fd, std.posix.F.SETFL, new_flags);
+                    },
+                    // Need to be checked further other OS that posix compliant
+                    else => return error.UnsopportedOS,
+                }
             },
             else => return e,
         };
