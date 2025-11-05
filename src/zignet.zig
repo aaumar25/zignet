@@ -305,8 +305,12 @@ pub const Endpoint = struct {
 /// of use. Read the message by calling `reader()` to use zig std.io.Reader and
 /// write the message by calling `writer()` to use zig std.io.Writer.
 pub const Socket = struct {
+    /// File descriptor
     fd: std.posix.socket_t,
+    /// Socket address
     sockaddr: SockAddr,
+    /// Exit function, allowing users to run the function on blocking operation.
+    exit_fn: ?*const fn () anyerror!void,
 
     pub const Error = error{ConnectionClosedByPeer};
 
@@ -493,8 +497,11 @@ pub const Socket = struct {
     };
     pub const Writer = std.net.Stream.Writer;
 
-    pub fn listen(endpoint: Endpoint) (std.posix.SocketError ||
-        std.posix.BindError || std.posix.ListenError)!Socket {
+    pub fn listen(
+        endpoint: Endpoint,
+        exit_fn: ?*const fn () anyerror!void,
+    ) (std.posix.SocketError || std.posix.BindError ||
+        std.posix.ListenError)!Socket {
         const sockaddr = endpoint.toSockAddr();
         const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix.socklen_t =
             switch (sockaddr) {
@@ -514,11 +521,14 @@ pub const Socket = struct {
         // Bind the socket to the specified endpoint
         try std.posix.bind(fd, sockaddr_ptr, socklen);
         try std.posix.listen(fd, 0);
-        return .{ .fd = fd, .sockaddr = sockaddr };
+        return .{ .fd = fd, .sockaddr = sockaddr, .exit_fn = exit_fn };
     }
 
     /// Connect to a server by endpoint.
-    pub fn connect(endpoint: Endpoint) (std.posix.ConnectError || std.posix.SocketError)!Socket {
+    pub fn connect(
+        endpoint: Endpoint,
+        exit_fn: ?*const fn () anyerror!void,
+    ) (std.posix.ConnectError || std.posix.SocketError)!Socket {
         const sockaddr = endpoint.toSockAddr();
         const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix.socklen_t =
             switch (sockaddr) {
@@ -531,12 +541,31 @@ pub const Socket = struct {
         // Create a socket
         const fd = try std.posix.socket(
             sockaddr_ptr.family,
-            std.posix.SOCK.STREAM,
+            std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
             std.posix.IPPROTO.TCP,
         );
         errdefer std.posix.close(fd);
-        try std.posix.connect(fd, sockaddr_ptr, socklen);
-        return .{ .fd = fd, .sockaddr = sockaddr };
+        const socket: Socket =
+            .{ .fd = fd, .sockaddr = sockaddr, .exit_fn = exit_fn };
+        std.posix.connect(fd, sockaddr_ptr, socklen) catch |e| switch (e) {
+            std.posix.ConnectError.WouldBlock => {
+                // Wait until the sockeet is ready to write.
+                try socket.waitToWrite();
+                // Check whether the connect has completed successfully.
+                // source:
+                // https://man7.org/linux/man-pages/man2/connect.2.html
+                // https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-connect
+                var opt: [@sizeOf(u32)]u8 = undefined;
+                try std.posix.getsockopt(
+                    socket.fd,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.ERROR,
+                    &opt,
+                );
+            },
+            else => return e,
+        };
+        return socket;
     }
 
     /// Connect using a hostname. Anything that is allocated by this function
@@ -545,6 +574,7 @@ pub const Socket = struct {
         allocator: std.mem.Allocator,
         name: []const u8,
         port: u16,
+        exit_fn: ?*const fn () anyerror!void,
     ) !Socket {
         const list = try std.net.getAddressList(allocator, name, port);
         defer list.deinit();
@@ -553,7 +583,7 @@ pub const Socket = struct {
         var err: std.posix.ConnectError = undefined;
         for (list.addrs) |addr| {
             const endpoint = try Endpoint.fromSockAddr(&addr.any);
-            return Socket.connect(endpoint) catch |e| {
+            return Socket.connect(endpoint, exit_fn) catch |e| {
                 switch (e) {
                     // These 3 errors are allowed to attempt reconnect by
                     // windows. With that allowance, instead of returning error,
@@ -621,9 +651,9 @@ pub const Socket = struct {
     /// Wait the socket until it is ready to read. If exit function is given,
     /// this execute the function and exit from this function if the exit function
     /// return error.
-    pub fn waitToRead(self: Socket, exit_fn: ?*const fn () anyerror!void) anyerror!void {
+    pub fn waitToRead(self: Socket) anyerror!void {
         while (readyToRead(self.fd, 0)) |ready| {
-            if (exit_fn) |exit|
+            if (self.exit_fn) |exit|
                 exit() catch |e| return e;
             if (ready) return;
         } else |e| return e;
@@ -634,9 +664,9 @@ pub const Socket = struct {
     /// Wait the socket until it is ready to write. If exit function is given,
     /// this execute the function and exit from this function if the exit function
     /// return error.
-    pub fn waitToWrite(self: Socket, exit_fn: ?*const fn () anyerror!void) anyerror!void {
+    pub fn waitToWrite(self: Socket) anyerror!void {
         while (readyToWrite(self.fd, 0)) |ready| {
-            if (exit_fn) |exit|
+            if (self.exit_fn) |exit|
                 exit() catch |e| return e;
             if (ready) return;
         } else |e| return e;
