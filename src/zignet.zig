@@ -563,6 +563,11 @@ pub const Socket = struct {
                     std.posix.SO.ERROR,
                     &opt,
                 );
+                // Reset the socket mode back to blocking
+                const flags =
+                    try std.posix.fcntl(socket.fd, std.posix.F.GETFL, 0);
+                const new_flags = flags & ~@as(usize, std.posix.SOCK.NONBLOCK);
+                _ = try std.posix.fcntl(socket.fd, std.posix.F.SETFL, new_flags);
             },
             else => return e,
         };
