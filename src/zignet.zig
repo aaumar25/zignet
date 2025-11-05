@@ -636,6 +636,11 @@ pub const Socket = struct {
         var err: std.posix.ConnectError = undefined;
         for (list.addrs) |addr| {
             const endpoint = try Endpoint.fromSockAddr(&addr.any);
+            // TODO: Support IPv6
+            switch (endpoint.addr) {
+                .ipv6 => continue,
+                .ipv4 => {},
+            }
             return Socket.connect(endpoint, exit_fn) catch |e| {
                 switch (e) {
                     // These 3 errors are allowed to attempt reconnect by
