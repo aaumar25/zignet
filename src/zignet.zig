@@ -500,8 +500,8 @@ pub const Socket = struct {
     pub fn listen(
         endpoint: Endpoint,
         exit_fn: ?*const fn () anyerror!void,
-    ) (std.posix.SocketError || std.posix.BindError ||
-        std.posix.ListenError)!Socket {
+    ) anyerror!Socket {
+        // Have to return any error due to the nature of the `exit_fn`
         const sockaddr = endpoint.toSockAddr();
         const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix.socklen_t =
             switch (sockaddr) {
@@ -528,7 +528,8 @@ pub const Socket = struct {
     pub fn connect(
         endpoint: Endpoint,
         exit_fn: ?*const fn () anyerror!void,
-    ) (std.posix.ConnectError || std.posix.SocketError)!Socket {
+    ) anyerror!Socket {
+        // Have to return any error due to the nature of the `exit_fn`
         const sockaddr = endpoint.toSockAddr();
         const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix.socklen_t =
             switch (sockaddr) {
@@ -575,7 +576,7 @@ pub const Socket = struct {
         name: []const u8,
         port: u16,
         exit_fn: ?*const fn () anyerror!void,
-    ) !Socket {
+    ) anyerror!Socket {
         const list = try std.net.getAddressList(allocator, name, port);
         defer list.deinit();
 
