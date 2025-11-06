@@ -296,6 +296,13 @@ pub const Endpoint = struct {
         } else return Error.UnsupportedFamily;
     }
 
+    pub fn format(
+        self: @This(),
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try writer.print("{f}:{d}", .{ self.addr, self.port });
+    }
+
     pub const Error = error{UnsupportedFamily};
 };
 
