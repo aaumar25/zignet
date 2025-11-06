@@ -687,6 +687,20 @@ pub const Socket = struct {
         return .{ .fd = fd, .exit_fn = exit_fn };
     }
 
+    pub fn getLocalEndPoint(self: Socket) !Endpoint {
+        var sockaddr: std.posix.sockaddr = undefined;
+        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+        try std.posix.getsockname(self.fd, &sockaddr, &sockaddr_len);
+        return try Endpoint.fromSockAddr(&sockaddr);
+    }
+
+    pub fn getRemoteEndPoint(self: Socket) !Endpoint {
+        var sockaddr: std.posix.sockaddr = undefined;
+        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+        try std.posix.getpeername(self.fd, &sockaddr, &sockaddr_len);
+        return try Endpoint.fromSockAddr(&sockaddr);
+    }
+
     /// Return `Socket.Reader`. Use `Socket.Reader.Interface` as the interface
     /// to std.Io.Reader in order to read the message. Note that the socket is
     /// blocking if there is no message to be read. Consider call `waitToRead()`
