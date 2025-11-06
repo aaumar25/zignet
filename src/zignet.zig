@@ -1,12 +1,7 @@
 const Network = @This();
 const std = @import("std");
-const builtin = @import("builtin");
 
-const SockAddr = union(enum) {
-    any: std.posix.sockaddr,
-    ipv4: std.posix.sockaddr.in,
-    ipv6: std.posix.sockaddr.in6,
-};
+const builtin = @import("builtin");
 
 const AddressFamily = enum { ipv4, ipv6 };
 
@@ -249,6 +244,11 @@ pub const Endpoint = struct {
     addr: Address,
     port: u16,
 
+    const SockAddr = union(enum) {
+        ipv4: std.posix.sockaddr.in,
+        ipv6: std.posix.sockaddr.in6,
+    };
+
     /// Convert the endpoint to the SockAddr based on the address family.
     pub fn toSockAddr(self: Endpoint) SockAddr {
         switch (self.addr) {
@@ -307,8 +307,6 @@ pub const Endpoint = struct {
 pub const Socket = struct {
     /// File descriptor
     fd: std.posix.socket_t,
-    /// Socket address
-    sockaddr: SockAddr,
     /// Exit function, allowing users to run the function on blocking operation.
     exit_fn: ?*const fn () anyerror!void,
 
@@ -507,7 +505,6 @@ pub const Socket = struct {
             switch (sockaddr) {
                 .ipv4 => |in| .{ @ptrCast(&in), @sizeOf(@TypeOf(in)) },
                 .ipv6 => |in6| .{ @ptrCast(&in6), @sizeOf(@TypeOf(in6)) },
-                .any => |any| .{ &any, @sizeOf(@TypeOf(any)) },
             };
         // NOTE: Instead of providing protocol TCP, we use 0 since using protocol
         //       TCP does not allow to connect with hostname.
@@ -521,11 +518,12 @@ pub const Socket = struct {
         // Bind the socket to the specified endpoint
         try std.posix.bind(fd, sockaddr_ptr, socklen);
         try std.posix.listen(fd, 0);
-        return .{ .fd = fd, .sockaddr = sockaddr, .exit_fn = exit_fn };
+        return .{ .fd = fd, .exit_fn = exit_fn };
     }
 
     /// Connect to a server by endpoint.
     pub fn connect(
+        /// Remote endpoint to be connected.
         endpoint: Endpoint,
         exit_fn: ?*const fn () anyerror!void,
     ) anyerror!Socket {
@@ -535,10 +533,7 @@ pub const Socket = struct {
             switch (sockaddr) {
                 .ipv4 => |in| .{ @ptrCast(&in), @sizeOf(@TypeOf(in)) },
                 .ipv6 => |in6| .{ @ptrCast(&in6), @sizeOf(@TypeOf(in6)) },
-                .any => |any| .{ &any, @sizeOf(@TypeOf(any)) },
             };
-        // NOTE: Instead of providing protocol TCP, we use 0 since using protocol
-        //       TCP does not allow to connect with hostname.
         // Create a socket
         const fd = try std.posix.socket(
             sockaddr_ptr.family,
@@ -546,9 +541,8 @@ pub const Socket = struct {
             std.posix.IPPROTO.TCP,
         );
         errdefer std.posix.close(fd);
-        const socket: Socket =
-            .{ .fd = fd, .sockaddr = sockaddr, .exit_fn = exit_fn };
-        std.posix.connect(fd, sockaddr_ptr, socklen) catch |e| switch (e) {
+        const socket: Socket = .{ .fd = fd, .exit_fn = exit_fn };
+        std.posix.connect(socket.fd, sockaddr_ptr, socklen) catch |e| switch (e) {
             std.posix.ConnectError.WouldBlock => {
                 // Wait until the socket is ready to write.
                 try socket.waitToWrite();
@@ -675,16 +669,15 @@ pub const Socket = struct {
         self: Socket,
         exit_fn: ?*const fn () anyerror!void,
     ) std.posix.AcceptError!Socket {
-        var accepted_addr: SockAddr = .{ .any = undefined };
-        var addr_size: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+        var accepted_addr: std.posix.sockaddr = undefined;
+        var addr_size: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
         const fd = try std.posix.accept(
             self.fd,
-            &accepted_addr.any,
+            &accepted_addr,
             &addr_size,
             0,
         );
-
-        return .{ .fd = fd, .sockaddr = accepted_addr, .exit_fn = exit_fn };
+        return .{ .fd = fd, .exit_fn = exit_fn };
     }
 
     /// Return `Socket.Reader`. Use `Socket.Reader.Interface` as the interface
@@ -797,7 +790,6 @@ test "convert sockaddr" {
     const any: *const std.posix.sockaddr = switch (sockaddr) {
         .ipv4 => |in| @ptrCast(&in),
         .ipv6 => |in6| @ptrCast(&in6),
-        .any => |any| &any,
     };
     try std.testing.expectEqual(any.family, std.posix.AF.INET);
     // Convert back to endpoint
