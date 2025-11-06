@@ -638,10 +638,7 @@ pub const Socket = struct {
         for (list.addrs) |addr| {
             const endpoint = try Endpoint.fromSockAddr(&addr.any);
             // TODO: Support IPv6
-            switch (endpoint.addr) {
-                .ipv6 => continue,
-                .ipv4 => {},
-            }
+
             return Socket.connect(endpoint, exit_fn) catch |e| {
                 switch (e) {
                     // These 3 errors are allowed to attempt reconnect by
@@ -689,14 +686,14 @@ pub const Socket = struct {
 
     pub fn getLocalEndPoint(self: Socket) !Endpoint {
         var sockaddr: std.posix.sockaddr = undefined;
-        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in6);
         try std.posix.getsockname(self.fd, &sockaddr, &sockaddr_len);
         return try Endpoint.fromSockAddr(&sockaddr);
     }
 
     pub fn getRemoteEndPoint(self: Socket) !Endpoint {
         var sockaddr: std.posix.sockaddr = undefined;
-        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in6);
         try std.posix.getpeername(self.fd, &sockaddr, &sockaddr_len);
         return try Endpoint.fromSockAddr(&sockaddr);
     }
