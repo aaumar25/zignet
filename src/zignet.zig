@@ -112,17 +112,13 @@ pub const Address = union(AddressFamily) {
                     try writer.writeAll(":");
                 }
             }
+            if (self.scope_id != 0) try writer.print("%{d}", .{self.scope_id});
             try writer.writeAll("]");
         }
 
-        /// Parse an IPv6 representation according to the canonical format
-        /// described in
-        /// [RFC5952](https://datatracker.ietf.org/doc/html/rfc5952). The
-        /// "scope ID" (otherwise known as "zone ID", `<zone_id>`) is
-        /// intentionally not supported as parsing according to
-        /// [RFC6874](https://datatracker.ietf.org/doc/html/rfc6874) is highly
-        /// platform-specific and difficult to validate.
-        /// (See https://www.w3.org/Bugs/Public/show_bug.cgi?id=27234#c2).
+        /// Parse an IPv6 representation. Scope ID may be represented by suffix
+        /// "%ID" where ID shall be number. This library does not support using
+        /// Scope ID with device name, i.e., eth0.
         pub fn parse(string: []const u8) (Error || std.fmt.ParseIntError)!IPv6 {
             if (string.len < 2 or string.len > 39) {
                 return error.InvalidFormat;
@@ -183,6 +179,11 @@ pub const Address = union(AddressFamily) {
                     },
                     'a'...'f', 'A'...'F', '0'...'9' => {
                         groups[cg_index].len += 1;
+                    },
+                    '%' => {
+                        // Parse scope ID.
+                        ip.scope_id = try std.fmt.parseUnsigned(u32, string[i + 1 ..], 0);
+                        break;
                     },
                     else => {
                         return error.InvalidFormat;
@@ -541,6 +542,7 @@ pub const Socket = struct {
                 .ipv4 => |in| .{ @ptrCast(&in), @sizeOf(@TypeOf(in)) },
                 .ipv6 => |in6| .{ @ptrCast(&in6), @sizeOf(@TypeOf(in6)) },
             };
+        std.log.debug("trying to connect to {f}", .{endpoint});
         // Create a socket
         const fd = try std.posix.socket(
             sockaddr_ptr.family,
