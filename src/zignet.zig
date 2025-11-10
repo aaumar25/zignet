@@ -539,10 +539,9 @@ pub const Socket = struct {
         const sockaddr = endpoint.toSockAddr();
         const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix.socklen_t =
             switch (sockaddr) {
-                .ipv4 => |in| .{ @ptrCast(&in), @sizeOf(@TypeOf(in)) },
-                .ipv6 => |in6| .{ @ptrCast(&in6), @sizeOf(@TypeOf(in6)) },
+                .ipv4 => |in| .{ @ptrCast(@alignCast(&in)), @sizeOf(@TypeOf(in)) },
+                .ipv6 => |in6| .{ @ptrCast(@alignCast(&in6)), @sizeOf(@TypeOf(in6)) },
             };
-        std.log.debug("trying to connect to {f}", .{endpoint});
         // Create a socket
         const fd = try std.posix.socket(
             sockaddr_ptr.family,
@@ -639,8 +638,6 @@ pub const Socket = struct {
         var err: std.posix.ConnectError = undefined;
         for (list.addrs) |addr| {
             const endpoint = try Endpoint.fromSockAddr(&addr.any);
-            // TODO: Support IPv6
-
             return Socket.connect(endpoint, exit_fn) catch |e| {
                 switch (e) {
                     // These 3 errors are allowed to attempt reconnect by
