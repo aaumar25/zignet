@@ -553,7 +553,15 @@ pub const Socket = struct {
         std.posix.connect(socket.fd, sockaddr_ptr, socklen) catch |e| switch (e) {
             std.posix.ConnectError.WouldBlock => {
                 // Wait until the socket is ready to write.
-                try socket.waitToWrite();
+                const timeout = 3000; // Connection timeout after 3 s.
+                var timer = try std.time.Timer.start();
+                while (readyToWrite(socket.fd, 0)) |ready| {
+                    if (timer.read() / std.time.ns_per_ms > timeout)
+                        return std.posix.ConnectError.ConnectionTimedOut;
+                    if (exit_fn) |exit|
+                        exit() catch |err| return err;
+                    if (ready) break;
+                } else |err| return err;
                 var opt: [@sizeOf(u32)]u8 = undefined;
                 var len: i32 = @intCast(opt.len);
                 switch (builtin.os.tag) {
