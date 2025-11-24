@@ -643,7 +643,7 @@ pub const Socket = struct {
         defer list.deinit();
 
         if (list.addrs.len == 0) return error.UnknownHostName;
-        var err: std.posix.ConnectError = undefined;
+        var err: (std.posix.ConnectError || Error) = undefined;
         for (list.addrs) |addr| {
             const endpoint = try Endpoint.fromSockAddr(&addr.any);
             return Socket.connect(endpoint, exit_fn) catch |e| {
@@ -662,6 +662,12 @@ pub const Socket = struct {
                     },
                     std.posix.ConnectError.NetworkUnreachable => {
                         err = std.posix.ConnectError.NetworkUnreachable;
+                        continue;
+                    },
+                    // This error is returned if attempting to connect to an IP
+                    // but the server has not listen to the IP.
+                    Error.ConnectionClosedByPeer => {
+                        err = Error.ConnectionClosedByPeer;
                         continue;
                     },
                     else => return e,
