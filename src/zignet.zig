@@ -686,11 +686,12 @@ pub const Socket = struct {
         self: Socket,
         exit_fn: ?*const fn () anyerror!void,
     ) std.posix.AcceptError!Socket {
-        var accepted_addr: std.posix.sockaddr = undefined;
+        var accepted_addr: std.posix.sockaddr.storage = undefined;
         var addr_size: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        const accepted_addr_ptr: *std.posix.sockaddr = @ptrCast(&accepted_addr);
         const fd = try std.posix.accept(
             self.fd,
-            &accepted_addr,
+            accepted_addr_ptr,
             &addr_size,
             0,
         );
@@ -698,17 +699,19 @@ pub const Socket = struct {
     }
 
     pub fn getLocalEndPoint(self: Socket) !Endpoint {
-        var sockaddr: std.posix.sockaddr = undefined;
-        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in6);
-        try std.posix.getsockname(self.fd, &sockaddr, &sockaddr_len);
-        return try Endpoint.fromSockAddr(&sockaddr);
+        var sockaddr: std.posix.sockaddr.storage = undefined;
+        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        const sockaddr_ptr: *std.posix.sockaddr = @ptrCast(&sockaddr);
+        try std.posix.getsockname(self.fd, sockaddr_ptr, &sockaddr_len);
+        return try Endpoint.fromSockAddr(sockaddr_ptr);
     }
 
     pub fn getRemoteEndPoint(self: Socket) !Endpoint {
-        var sockaddr: std.posix.sockaddr = undefined;
-        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in6);
-        try std.posix.getpeername(self.fd, &sockaddr, &sockaddr_len);
-        return try Endpoint.fromSockAddr(&sockaddr);
+        var sockaddr: std.posix.sockaddr.storage = undefined;
+        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        const sockaddr_ptr: *std.posix.sockaddr = @ptrCast(&sockaddr);
+        try std.posix.getpeername(self.fd, sockaddr_ptr, &sockaddr_len);
+        return try Endpoint.fromSockAddr(sockaddr_ptr);
     }
 
     /// Return `Socket.Reader`. Use `Socket.Reader.Interface` as the interface
