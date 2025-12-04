@@ -328,8 +328,15 @@ pub const Socket = struct {
 
     pub const Reader = switch (builtin.os.tag) {
         .windows => struct {
+            /// Intended to be accessed directly by users.
             interface: std.Io.Reader,
+            /// Intended to be accessed directly by users if necessary. Meant to
+            /// store the file descriptor of the socket.
             fd: std.posix.socket_t,
+            /// Shall not be accessed by users. Meant to keep the overlapped
+            /// pointer valid.
+            overlapped: ?std.os.windows.OVERLAPPED = null,
+            /// Store the actual error if interface return `ReadFailed`.
             error_state: ?Reader.Error,
 
             pub const Error = std.posix.ReadError || error{
@@ -381,11 +388,51 @@ pub const Socket = struct {
                     try io_r.writableVectorWsa(&iovecs, data);
                 const bufs = iovecs[0..bufs_n];
                 std.debug.assert(bufs[0].len != 0);
-                const n = streamBufs(r, bufs) catch |err| n: {
-                    if (err == Reader.Error.WouldBlock) break :n 0;
-                    r.error_state = err;
+                var n: u32 = undefined;
+                if (r.overlapped) |_| {
+                    var result_flags: u32 = undefined;
+                    if (std.os.windows.ws2_32.WSAGetOverlappedResult(
+                        r.fd,
+                        &r.overlapped.?,
+                        &n,
+                        std.os.windows.FALSE,
+                        &result_flags,
+                    ) == std.os.windows.FALSE) {
+                        handleRecvError(std.os
+                            .windows.ws2_32.WSAGetLastError()) catch |err| {
+                            if (err == error.WouldBlock)
+                                return error.EndOfStream;
+                            r.error_state = err;
+                            return error.ReadFailed;
+                        };
+                    }
+                    r.overlapped = null;
+                } else {
+                    var flags: u32 = 0;
+                    r.overlapped = std.mem.zeroInit(std.os.windows.OVERLAPPED, .{});
+                    if (std.os.windows.ws2_32.WSARecv(
+                        r.fd,
+                        bufs.ptr,
+                        @intCast(bufs.len),
+                        &n,
+                        &flags,
+                        &r.overlapped.?,
+                        null,
+                    ) == std.os.windows.ws2_32.SOCKET_ERROR)
+                        // Keep the IO reads until new message is received.
+                        handleRecvError(std.os
+                            .windows.ws2_32.WSAGetLastError()) catch |err| {
+                            if (err == error.WouldBlock) return error.EndOfStream;
+                            r.error_state = err;
+                            return error.ReadFailed;
+                        };
+                }
+                // If 0 bytes are received, the connection was closed gracefully
+                // from remote end.
+                if (n == 0) {
+                    r.error_state = Reader.Error.ConnectionResetByPeer;
                     return error.ReadFailed;
-                };
+                }
                 if (n > data_size) {
                     io_r.seek = 0;
                     io_r.end = n - data_size;
@@ -409,50 +456,16 @@ pub const Socket = struct {
                     .WSAENETDOWN => return error.NetworkSubsystemFailed,
                     .WSAENETRESET => return error.ConnectionResetByPeer,
                     .WSAENOTCONN => return error.SocketNotConnected,
-                    .WSAEWOULDBLOCK => return error.WouldBlock,
-                    // WSAStartup must be called before this function
+                    .WSAEWOULDBLOCK,
+                    .WSA_IO_PENDING,
+                    .WSA_IO_INCOMPLETE,
+                    => return error.WouldBlock,
+                    // WSAStartup must be called before this function.
                     .WSANOTINITIALISED => unreachable,
-                    .WSA_IO_PENDING => unreachable,
-                    // not using overlapped I/O
+                    // not using overlapped I/O.
                     .WSA_OPERATION_ABORTED => unreachable,
                     else => |err| return std.os.windows.unexpectedWSAError(err),
                 }
-            }
-
-            fn streamBufs(
-                r: *Reader,
-                bufs: []std.os.windows.ws2_32.WSABUF,
-            ) Reader.Error!u32 {
-                var flags: u32 = 0;
-                var overlapped: std.os.windows.OVERLAPPED = std.mem.zeroes(std
-                    .os.windows.OVERLAPPED);
-
-                var n: u32 = undefined;
-                if (std.os.windows.ws2_32.WSARecv(
-                    r.fd,
-                    bufs.ptr,
-                    @intCast(bufs.len),
-                    &n,
-                    &flags,
-                    &overlapped,
-                    null,
-                ) == std.os.windows.ws2_32.SOCKET_ERROR) switch (std.os.windows
-                    .ws2_32.WSAGetLastError()) {
-                    .WSA_IO_PENDING => {
-                        var result_flags: u32 = undefined;
-                        if (std.os.windows.ws2_32.WSAGetOverlappedResult(
-                            r.fd,
-                            &overlapped,
-                            &n,
-                            std.os.windows.TRUE,
-                            &result_flags,
-                        ) == std.os.windows.FALSE) try handleRecvError(std.os
-                            .windows.ws2_32.WSAGetLastError());
-                    },
-                    else => |winsock_error| try handleRecvError(winsock_error),
-                };
-
-                return n;
             }
         },
         else => struct {
@@ -486,7 +499,7 @@ pub const Socket = struct {
 
             /// Number of slices to store on the stack, when trying to send as
             /// many byte vectors through the underlying read calls as possible.
-            const max_buffers_len = 16;
+            const max_buffers_len = 8;
 
             fn stream(
                 io_r: *std.Io.Reader,
@@ -512,11 +525,20 @@ pub const Socket = struct {
                     try io_r.writableVectorPosix(&iovecs_buffer, data);
                 const dest = iovecs_buffer[0..dest_n];
                 std.debug.assert(dest[0].len > 0);
-                const n = std.posix.readv(r.fd, dest) catch |err| n: {
-                    if (err == Reader.Error.WouldBlock) break :n 0;
+                const n = std.posix.readv(r.fd, dest) catch |err| {
+                    // Handle `WouldBlock` to `EndOfStream`. The user has to
+                    // ensure that the socket is already receiving a message.
+                    if (err == std.posix.ReadError.WouldBlock)
+                        return error.EndOfStream;
                     r.error_state = err;
                     return error.ReadFailed;
                 };
+                // If 0 bytes are received, the connection was closed gracefully
+                // from remote end.
+                if (n == 0) {
+                    r.error_state = Reader.Error.ConnectionResetByPeer;
+                    return error.ReadFailed;
+                }
                 if (n > data_size) {
                     io_r.seek = 0;
                     io_r.end = n - data_size;
@@ -530,7 +552,7 @@ pub const Socket = struct {
         .windows => struct {
             interface: std.Io.Writer,
             fd: std.posix.socket_t,
-            err: ?Writer.Error = null,
+            error_state: ?Writer.Error = null,
 
             pub const Error = std.posix.SendMsgError || error{
                 ConnectionResetByPeer,
@@ -554,7 +576,7 @@ pub const Socket = struct {
             }
 
             fn addWsaBuf(
-                v: []std.windows.ws2_32.WSABUF,
+                v: []std.os.windows.ws2_32.WSABUF,
                 i: *u32,
                 bytes: []const u8,
             ) void {
@@ -586,7 +608,7 @@ pub const Socket = struct {
                     @alignCast(@fieldParentPtr("interface", io_w));
                 const buffered = io_w.buffered();
                 comptime std.debug.assert(builtin.os.tag == .windows);
-                var iovecs: [max_buffers_len]std.windows.ws2_32.WSABUF =
+                var iovecs: [max_buffers_len]std.os.windows.ws2_32.WSABUF =
                     undefined;
                 var len: u32 = 0;
                 addWsaBuf(&iovecs, &len, buffered);
@@ -630,16 +652,16 @@ pub const Socket = struct {
                     },
                 };
                 const n =
-                    sendBufs(w.stream.handle, iovecs[0..len]) catch |err| n: {
+                    sendBufs(w.fd, iovecs[0..len]) catch |err| n: {
                         if (err == Writer.Error.WouldBlock) break :n 0;
-                        w.err = err;
+                        w.error_state = err;
                         return error.WriteFailed;
                     };
                 return io_w.consume(n);
             }
 
             fn handleSendError(
-                winsock_error: std.windows.ws2_32.WinsockError,
+                winsock_error: std.os.windows.ws2_32.WinsockError,
             ) Writer.Error!void {
                 switch (winsock_error) {
                     .WSAECONNABORTED => return error.ConnectionResetByPeer,
@@ -666,18 +688,18 @@ pub const Socket = struct {
                     .WSA_IO_PENDING => unreachable,
                     // not using overlapped I/O
                     .WSA_OPERATION_ABORTED => unreachable,
-                    else => |err| return std.windows.unexpectedWSAError(err),
+                    else => |err| return std.os.windows.unexpectedWSAError(err),
                 }
             }
 
             fn sendBufs(
                 fd: std.posix.socket_t,
-                bufs: []std.windows.ws2_32.WSABUF,
+                bufs: []std.os.windows.ws2_32.WSABUF,
             ) Writer.Error!u32 {
                 var n: u32 = undefined;
-                var overlapped: std.windows.OVERLAPPED =
-                    std.mem.zeroes(std.windows.OVERLAPPED);
-                if (std.windows.ws2_32.WSASend(
+                var overlapped: std.os.windows.OVERLAPPED =
+                    std.mem.zeroes(std.os.windows.OVERLAPPED);
+                if (std.os.windows.ws2_32.WSASend(
                     fd,
                     bufs.ptr,
                     @intCast(bufs.len),
@@ -685,18 +707,18 @@ pub const Socket = struct {
                     0,
                     &overlapped,
                     null,
-                ) == std.windows.ws2_32.SOCKET_ERROR)
-                    switch (std.windows.ws2_32.WSAGetLastError()) {
+                ) == std.os.windows.ws2_32.SOCKET_ERROR)
+                    switch (std.os.windows.ws2_32.WSAGetLastError()) {
                         .WSA_IO_PENDING => {
                             var result_flags: u32 = undefined;
-                            if (std.windows.ws2_32.WSAGetOverlappedResult(
+                            if (std.os.windows.ws2_32.WSAGetOverlappedResult(
                                 fd,
                                 &overlapped,
                                 &n,
-                                std.windows.TRUE,
+                                std.os.windows.TRUE,
                                 &result_flags,
-                            ) == std.windows.FALSE)
-                                try handleSendError(std.windows.ws2_32
+                            ) == std.os.windows.FALSE)
+                                try handleSendError(std.os.windows.ws2_32
                                     .WSAGetLastError());
                         },
                         else => |winsock_error| {
@@ -710,7 +732,7 @@ pub const Socket = struct {
         else => struct {
             interface: std.Io.Writer,
             fd: std.posix.socket_t,
-            err: ?Writer.Error = null,
+            error_state: ?Writer.Error = null,
 
             pub const Error = std.posix.SendMsgError || error{
                 ConnectionResetByPeer,
@@ -729,7 +751,7 @@ pub const Socket = struct {
                         .buffer = buffer,
                     },
                     .fd = fd,
-                    .err = null,
+                    .error_state = null,
                 };
             }
 
@@ -816,7 +838,7 @@ pub const Socket = struct {
                     flags,
                 ) catch |err| {
                     if (err == Writer.Error.WouldBlock) return 0;
-                    w.err = err;
+                    w.error_state = err;
                     return error.WriteFailed;
                 });
             }
