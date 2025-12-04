@@ -315,15 +315,28 @@ pub const Endpoint = struct {
 pub const Socket = struct {
     /// File descriptor
     fd: std.posix.socket_t,
-    /// Exit function, allowing users to run the function on blocking operation.
-    exit_fn: ?*const fn () anyerror!void,
 
-    pub const Error = error{ConnectionClosedByPeer};
+    pub const Error = (error{
+        UnknownHostName,
+        InterruptedByLocal,
+    } ||
+        std.posix.ConnectError ||
+        std.posix.SocketError ||
+        std.posix.ListenError ||
+        std.posix.BindError ||
+        std.posix.AcceptError);
 
     pub const Reader = switch (builtin.os.tag) {
         .windows => struct {
+            /// Intended to be accessed directly by users.
             interface: std.Io.Reader,
+            /// Intended to be accessed directly by users if necessary. Meant to
+            /// store the file descriptor of the socket.
             fd: std.posix.socket_t,
+            /// Shall not be accessed by users. Meant to keep the overlapped
+            /// pointer valid.
+            overlapped: ?std.os.windows.OVERLAPPED = null,
+            /// Store the actual error if interface return `ReadFailed`.
             error_state: ?Reader.Error,
 
             pub const Error = std.posix.ReadError || error{
@@ -350,7 +363,11 @@ pub const Socket = struct {
                 };
             }
 
-            fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            fn stream(
+                io_r: *std.Io.Reader,
+                io_w: *std.Io.Writer,
+                limit: std.Io.Limit,
+            ) std.Io.Reader.StreamError!usize {
                 const dest = limit.slice(try io_w.writableSliceGreedy(1));
                 var bufs: [1][]u8 = .{dest};
                 const n = try readVec(io_r, &bufs);
@@ -358,24 +375,64 @@ pub const Socket = struct {
                 return n;
             }
 
-            fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+            fn readVec(
+                io_r: *std.Io.Reader,
+                data: [][]u8,
+            ) std.Io.Reader.Error!usize {
                 const max_buffers_len = 8;
-                const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
-                if (io_r.bufferedLen() == 0) {
-                    // If the stream is not ready to read while there is nothing
-                    // left in the buffer, it is the end of the stream.
-                    if (!(readyToRead(r.fd, 0) catch
-                        return error.ReadFailed))
-                        return error.EndOfStream;
-                }
-                var iovecs: [max_buffers_len]std.os.windows.ws2_32.WSABUF = undefined;
-                const bufs_n, const data_size = try io_r.writableVectorWsa(&iovecs, data);
+                const r: *Reader =
+                    @alignCast(@fieldParentPtr("interface", io_r));
+                var iovecs: [max_buffers_len]std.os.windows.ws2_32.WSABUF =
+                    undefined;
+                const bufs_n, const data_size =
+                    try io_r.writableVectorWsa(&iovecs, data);
                 const bufs = iovecs[0..bufs_n];
                 std.debug.assert(bufs[0].len != 0);
-                const n = streamBufs(r, bufs) catch |err| {
-                    r.error_state = err;
+                var n: u32 = undefined;
+                if (r.overlapped) |_| {
+                    var result_flags: u32 = undefined;
+                    if (std.os.windows.ws2_32.WSAGetOverlappedResult(
+                        r.fd,
+                        &r.overlapped.?,
+                        &n,
+                        std.os.windows.FALSE,
+                        &result_flags,
+                    ) == std.os.windows.FALSE) {
+                        handleRecvError(std.os
+                            .windows.ws2_32.WSAGetLastError()) catch |err| {
+                            if (err == error.WouldBlock)
+                                return error.EndOfStream;
+                            r.error_state = err;
+                            return error.ReadFailed;
+                        };
+                    }
+                    r.overlapped = null;
+                } else {
+                    var flags: u32 = 0;
+                    r.overlapped = std.mem.zeroInit(std.os.windows.OVERLAPPED, .{});
+                    if (std.os.windows.ws2_32.WSARecv(
+                        r.fd,
+                        bufs.ptr,
+                        @intCast(bufs.len),
+                        &n,
+                        &flags,
+                        &r.overlapped.?,
+                        null,
+                    ) == std.os.windows.ws2_32.SOCKET_ERROR)
+                        // Keep the IO reads until new message is received.
+                        handleRecvError(std.os
+                            .windows.ws2_32.WSAGetLastError()) catch |err| {
+                            if (err == error.WouldBlock) return error.EndOfStream;
+                            r.error_state = err;
+                            return error.ReadFailed;
+                        };
+                }
+                // If 0 bytes are received, the connection was closed gracefully
+                // from remote end.
+                if (n == 0) {
+                    r.error_state = Reader.Error.ConnectionResetByPeer;
                     return error.ReadFailed;
-                };
+                }
                 if (n > data_size) {
                     io_r.seek = 0;
                     io_r.end = n - data_size;
@@ -384,52 +441,31 @@ pub const Socket = struct {
                 return n;
             }
 
-            fn handleRecvError(winsock_error: std.os.windows.ws2_32.WinsockError) Reader.Error!void {
+            fn handleRecvError(
+                winsock_error: std.os.windows.ws2_32.WinsockError,
+            ) Reader.Error!void {
                 switch (winsock_error) {
                     .WSAECONNRESET => return error.ConnectionResetByPeer,
-                    .WSAEFAULT => unreachable, // a pointer is not completely contained in user address space.
-                    .WSAEINPROGRESS, .WSAEINTR => unreachable, // deprecated and removed in WSA 2.2
+                    // a pointer is not completely contained in user address
+                    // space.
+                    .WSAEFAULT => unreachable,
+                    // deprecated and removed in WSA 2.2
+                    .WSAEINPROGRESS, .WSAEINTR => unreachable,
                     .WSAEINVAL => return error.SocketNotBound,
                     .WSAEMSGSIZE => return error.MessageTooBig,
                     .WSAENETDOWN => return error.NetworkSubsystemFailed,
                     .WSAENETRESET => return error.ConnectionResetByPeer,
                     .WSAENOTCONN => return error.SocketNotConnected,
-                    .WSAEWOULDBLOCK => return error.WouldBlock,
-                    .WSANOTINITIALISED => unreachable, // WSAStartup must be called before this function
-                    .WSA_IO_PENDING => unreachable,
-                    .WSA_OPERATION_ABORTED => unreachable, // not using overlapped I/O
+                    .WSAEWOULDBLOCK,
+                    .WSA_IO_PENDING,
+                    .WSA_IO_INCOMPLETE,
+                    => return error.WouldBlock,
+                    // WSAStartup must be called before this function.
+                    .WSANOTINITIALISED => unreachable,
+                    // not using overlapped I/O.
+                    .WSA_OPERATION_ABORTED => unreachable,
                     else => |err| return std.os.windows.unexpectedWSAError(err),
                 }
-            }
-
-            fn streamBufs(r: *Reader, bufs: []std.os.windows.ws2_32.WSABUF) Reader.Error!u32 {
-                var flags: u32 = 0;
-                var overlapped: std.os.windows.OVERLAPPED = std.mem.zeroes(std.os.windows.OVERLAPPED);
-
-                var n: u32 = undefined;
-                if (std.os.windows.ws2_32.WSARecv(
-                    r.fd,
-                    bufs.ptr,
-                    @intCast(bufs.len),
-                    &n,
-                    &flags,
-                    &overlapped,
-                    null,
-                ) == std.os.windows.ws2_32.SOCKET_ERROR) switch (std.os.windows.ws2_32.WSAGetLastError()) {
-                    .WSA_IO_PENDING => {
-                        var result_flags: u32 = undefined;
-                        if (std.os.windows.ws2_32.WSAGetOverlappedResult(
-                            r.fd,
-                            &overlapped,
-                            &n,
-                            std.os.windows.TRUE,
-                            &result_flags,
-                        ) == std.os.windows.FALSE) try handleRecvError(std.os.windows.ws2_32.WSAGetLastError());
-                    },
-                    else => |winsock_error| try handleRecvError(winsock_error),
-                };
-
-                return n;
             }
         },
         else => struct {
@@ -461,11 +497,15 @@ pub const Socket = struct {
                 };
             }
 
-            /// Number of slices to store on the stack, when trying to send as many byte
-            /// vectors through the underlying read calls as possible.
-            const max_buffers_len = 16;
+            /// Number of slices to store on the stack, when trying to send as
+            /// many byte vectors through the underlying read calls as possible.
+            const max_buffers_len = 8;
 
-            fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            fn stream(
+                io_r: *std.Io.Reader,
+                io_w: *std.Io.Writer,
+                limit: std.Io.Limit,
+            ) std.Io.Reader.StreamError!usize {
                 const dest = limit.slice(try io_w.writableSliceGreedy(1));
                 var bufs: [1][]u8 = .{dest};
                 const n = try readVec(io_r, &bufs);
@@ -473,25 +513,32 @@ pub const Socket = struct {
                 return n;
             }
 
-            /// Modified readVec to read when the socket is ready to read.
-            fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
-                const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
-
-                if (io_r.bufferedLen() == 0) {
-                    // If the stream is not ready to read while there is nothing
-                    // left in the buffer, it is the end of the stream.
-                    if (!(readyToRead(r.fd, 0) catch
-                        return error.ReadFailed))
-                        return error.EndOfStream;
-                }
+            /// Modified readVec
+            fn readVec(
+                io_r: *std.Io.Reader,
+                data: [][]u8,
+            ) std.Io.Reader.Error!usize {
+                const r: *Reader =
+                    @alignCast(@fieldParentPtr("interface", io_r));
                 var iovecs_buffer: [max_buffers_len]std.posix.iovec = undefined;
-                const dest_n, const data_size = try io_r.writableVectorPosix(&iovecs_buffer, data);
+                const dest_n, const data_size =
+                    try io_r.writableVectorPosix(&iovecs_buffer, data);
                 const dest = iovecs_buffer[0..dest_n];
                 std.debug.assert(dest[0].len > 0);
                 const n = std.posix.readv(r.fd, dest) catch |err| {
+                    // Handle `WouldBlock` to `EndOfStream`. The user has to
+                    // ensure that the socket is already receiving a message.
+                    if (err == std.posix.ReadError.WouldBlock)
+                        return error.EndOfStream;
                     r.error_state = err;
                     return error.ReadFailed;
                 };
+                // If 0 bytes are received, the connection was closed gracefully
+                // from remote end.
+                if (n == 0) {
+                    r.error_state = Reader.Error.ConnectionResetByPeer;
+                    return error.ReadFailed;
+                }
                 if (n > data_size) {
                     io_r.seek = 0;
                     io_r.end = n - data_size;
@@ -501,22 +548,317 @@ pub const Socket = struct {
             }
         },
     };
-    pub const Writer = std.net.Stream.Writer;
+    pub const Writer = switch (builtin.os.tag) {
+        .windows => struct {
+            interface: std.Io.Writer,
+            fd: std.posix.socket_t,
+            error_state: ?Writer.Error = null,
+
+            pub const Error = std.posix.SendMsgError || error{
+                ConnectionResetByPeer,
+                SocketNotBound,
+                MessageTooBig,
+                NetworkSubsystemFailed,
+                SystemResources,
+                SocketNotConnected,
+                Unexpected,
+            };
+
+            pub fn init(fd: std.posix.socket_t, buffer: []u8) Writer {
+                return .{
+                    .interface = .{
+                        .vtable = &.{ .drain = drain },
+                        .buffer = buffer,
+                    },
+                    .fd = fd,
+                    .error_state = null,
+                };
+            }
+
+            fn addWsaBuf(
+                v: []std.os.windows.ws2_32.WSABUF,
+                i: *u32,
+                bytes: []const u8,
+            ) void {
+                const cap = std.math.maxInt(u32);
+                var remaining = bytes;
+                while (remaining.len > cap) {
+                    if (v.len - i.* == 0) return;
+                    v[i.*] = .{ .buf = @constCast(remaining.ptr), .len = cap };
+                    i.* += 1;
+                    remaining = remaining[cap..];
+                } else {
+                    @branchHint(.likely);
+                    if (v.len - i.* == 0) return;
+                    v[i.*] = .{
+                        .buf = @constCast(remaining.ptr),
+                        .len = @intCast(remaining.len),
+                    };
+                    i.* += 1;
+                }
+            }
+
+            fn drain(
+                io_w: *std.Io.Writer,
+                data: []const []const u8,
+                splat: usize,
+            ) std.Io.Writer.Error!usize {
+                const max_buffers_len = 8;
+                const w: *Writer =
+                    @alignCast(@fieldParentPtr("interface", io_w));
+                const buffered = io_w.buffered();
+                comptime std.debug.assert(builtin.os.tag == .windows);
+                var iovecs: [max_buffers_len]std.os.windows.ws2_32.WSABUF =
+                    undefined;
+                var len: u32 = 0;
+                addWsaBuf(&iovecs, &len, buffered);
+                for (data[0 .. data.len - 1]) |bytes|
+                    addWsaBuf(&iovecs, &len, bytes);
+                const pattern = data[data.len - 1];
+                if (iovecs.len - len != 0) switch (splat) {
+                    0 => {},
+                    1 => addWsaBuf(&iovecs, &len, pattern),
+                    else => switch (pattern.len) {
+                        0 => {},
+                        1 => {
+                            const splat_buffer_candidate =
+                                io_w.buffer[io_w.end..];
+                            var backup_buffer: [64]u8 = undefined;
+                            const splat_buffer = if (splat_buffer_candidate
+                                .len >= backup_buffer.len)
+                                splat_buffer_candidate
+                            else
+                                &backup_buffer;
+                            const memset_len = @min(splat_buffer.len, splat);
+                            const buf = splat_buffer[0..memset_len];
+                            @memset(buf, pattern[0]);
+                            addWsaBuf(&iovecs, &len, buf);
+                            var remaining_splat = splat - buf.len;
+                            while (remaining_splat > splat_buffer.len and
+                                len < iovecs.len)
+                            {
+                                addWsaBuf(&iovecs, &len, splat_buffer);
+                                remaining_splat -= splat_buffer.len;
+                            }
+                            addWsaBuf(
+                                &iovecs,
+                                &len,
+                                splat_buffer[0..remaining_splat],
+                            );
+                        },
+                        else => for (0..@min(splat, iovecs.len - len)) |_| {
+                            addWsaBuf(&iovecs, &len, pattern);
+                        },
+                    },
+                };
+                const n =
+                    sendBufs(w.fd, iovecs[0..len]) catch |err| n: {
+                        if (err == Writer.Error.WouldBlock) break :n 0;
+                        w.error_state = err;
+                        return error.WriteFailed;
+                    };
+                return io_w.consume(n);
+            }
+
+            fn handleSendError(
+                winsock_error: std.os.windows.ws2_32.WinsockError,
+            ) Writer.Error!void {
+                switch (winsock_error) {
+                    .WSAECONNABORTED => return error.ConnectionResetByPeer,
+                    .WSAECONNRESET => return error.ConnectionResetByPeer,
+                    // a pointer is not completely contained in user address
+                    // space.
+                    .WSAEFAULT => unreachable,
+                    // deprecated and removed in WSA 2.2
+                    .WSAEINPROGRESS, .WSAEINTR => unreachable,
+                    .WSAEINVAL => return error.SocketNotBound,
+                    .WSAEMSGSIZE => return error.MessageTooBig,
+                    .WSAENETDOWN => return error.NetworkSubsystemFailed,
+                    .WSAENETRESET => return error.ConnectionResetByPeer,
+                    .WSAENOBUFS => return error.SystemResources,
+                    .WSAENOTCONN => return error.SocketNotConnected,
+                    .WSAENOTSOCK => unreachable, // not a socket
+                    // only for message-oriented sockets
+                    .WSAEOPNOTSUPP => unreachable,
+                    // cannot send on a socket after write shutdown
+                    .WSAESHUTDOWN => unreachable,
+                    .WSAEWOULDBLOCK => return error.WouldBlock,
+                    // WSAStartup must be called before this function
+                    .WSANOTINITIALISED => unreachable,
+                    .WSA_IO_PENDING => unreachable,
+                    // not using overlapped I/O
+                    .WSA_OPERATION_ABORTED => unreachable,
+                    else => |err| return std.os.windows.unexpectedWSAError(err),
+                }
+            }
+
+            fn sendBufs(
+                fd: std.posix.socket_t,
+                bufs: []std.os.windows.ws2_32.WSABUF,
+            ) Writer.Error!u32 {
+                var n: u32 = undefined;
+                var overlapped: std.os.windows.OVERLAPPED =
+                    std.mem.zeroes(std.os.windows.OVERLAPPED);
+                if (std.os.windows.ws2_32.WSASend(
+                    fd,
+                    bufs.ptr,
+                    @intCast(bufs.len),
+                    &n,
+                    0,
+                    &overlapped,
+                    null,
+                ) == std.os.windows.ws2_32.SOCKET_ERROR)
+                    switch (std.os.windows.ws2_32.WSAGetLastError()) {
+                        .WSA_IO_PENDING => {
+                            var result_flags: u32 = undefined;
+                            if (std.os.windows.ws2_32.WSAGetOverlappedResult(
+                                fd,
+                                &overlapped,
+                                &n,
+                                std.os.windows.TRUE,
+                                &result_flags,
+                            ) == std.os.windows.FALSE)
+                                try handleSendError(std.os.windows.ws2_32
+                                    .WSAGetLastError());
+                        },
+                        else => |winsock_error| {
+                            try handleSendError(winsock_error);
+                        },
+                    };
+
+                return n;
+            }
+        },
+        else => struct {
+            interface: std.Io.Writer,
+            fd: std.posix.socket_t,
+            error_state: ?Writer.Error = null,
+
+            pub const Error = std.posix.SendMsgError || error{
+                ConnectionResetByPeer,
+                SocketNotBound,
+                MessageTooBig,
+                NetworkSubsystemFailed,
+                SystemResources,
+                SocketNotConnected,
+                Unexpected,
+            };
+
+            pub fn init(fd: std.posix.socket_t, buffer: []u8) Writer {
+                return .{
+                    .interface = .{
+                        .vtable = &.{ .drain = drain },
+                        .buffer = buffer,
+                    },
+                    .fd = fd,
+                    .error_state = null,
+                };
+            }
+
+            fn addBuf(
+                v: []std.posix.iovec_const,
+                i: *@FieldType(std.posix.msghdr_const, "iovlen"),
+                bytes: []const u8,
+            ) void {
+                // OS checks ptr addr before length so zero length vectors must
+                // be omitted.
+                if (bytes.len == 0) return;
+                if (v.len - i.* == 0) return;
+                v[i.*] = .{ .base = bytes.ptr, .len = bytes.len };
+                i.* += 1;
+            }
+
+            fn drain(
+                io_w: *std.Io.Writer,
+                data: []const []const u8,
+                splat: usize,
+            ) std.Io.Writer.Error!usize {
+                const max_buffers_len = 8;
+                const w: *Writer =
+                    @alignCast(@fieldParentPtr("interface", io_w));
+                const buffered = io_w.buffered();
+                var iovecs: [max_buffers_len]std.posix.iovec_const = undefined;
+                var msg: std.posix.msghdr_const = .{
+                    .name = null,
+                    .namelen = 0,
+                    .iov = &iovecs,
+                    .iovlen = 0,
+                    .control = null,
+                    .controllen = 0,
+                    .flags = 0,
+                };
+                addBuf(&iovecs, &msg.iovlen, buffered);
+                for (data[0 .. data.len - 1]) |bytes|
+                    addBuf(&iovecs, &msg.iovlen, bytes);
+                const pattern = data[data.len - 1];
+                if (iovecs.len - msg.iovlen != 0) switch (splat) {
+                    0 => {},
+                    1 => addBuf(&iovecs, &msg.iovlen, pattern),
+                    else => switch (pattern.len) {
+                        0 => {},
+                        1 => {
+                            const splat_buffer_candidate =
+                                io_w.buffer[io_w.end..];
+                            var backup_buffer: [64]u8 = undefined;
+                            const splat_buffer =
+                                if (splat_buffer_candidate.len >= backup_buffer
+                                    .len)
+                                    splat_buffer_candidate
+                                else
+                                    &backup_buffer;
+                            const memset_len = @min(splat_buffer.len, splat);
+                            const buf = splat_buffer[0..memset_len];
+                            @memset(buf, pattern[0]);
+                            addBuf(&iovecs, &msg.iovlen, buf);
+                            var remaining_splat = splat - buf.len;
+                            while (remaining_splat > splat_buffer.len and
+                                iovecs.len - msg.iovlen != 0)
+                            {
+                                std.debug.assert(buf.len == splat_buffer.len);
+                                addBuf(&iovecs, &msg.iovlen, splat_buffer);
+                                remaining_splat -= splat_buffer.len;
+                            }
+                            addBuf(
+                                &iovecs,
+                                &msg.iovlen,
+                                splat_buffer[0..remaining_splat],
+                            );
+                        },
+                        else => {
+                            for (0..@min(splat, iovecs.len - msg.iovlen)) |_| {
+                                addBuf(&iovecs, &msg.iovlen, pattern);
+                            }
+                        },
+                    },
+                };
+                const flags = std.posix.MSG.NOSIGNAL | std.posix.MSG.DONTWAIT;
+                return io_w.consume(std.posix.sendmsg(
+                    w.fd,
+                    &msg,
+                    flags,
+                ) catch |err| {
+                    if (err == Writer.Error.WouldBlock) return 0;
+                    w.error_state = err;
+                    return error.WriteFailed;
+                });
+            }
+        },
+    };
 
     pub fn listen(
         endpoint: Endpoint,
-        exit_fn: ?*const fn () anyerror!void,
-    ) anyerror!Socket {
+    ) Error!Socket {
         // Have to return any error due to the nature of the `exit_fn`
         const sockaddr = endpoint.toSockAddr();
-        const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix.socklen_t =
+        const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std
+            .posix.socklen_t =
             switch (sockaddr) {
                 .ipv4 => |in| .{ @ptrCast(&in), @sizeOf(@TypeOf(in)) },
                 .ipv6 => |in6| .{ @ptrCast(&in6), @sizeOf(@TypeOf(in6)) },
             };
         // NOTE: Instead of providing protocol TCP, we use 0 since using protocol
         //       TCP does not allow to connect with hostname.
-        // Create a socket
+        // Create a blocking socket for listening to incoming connection.
         const fd = try std.posix.socket(
             sockaddr_ptr.family,
             std.posix.SOCK.STREAM,
@@ -526,108 +868,76 @@ pub const Socket = struct {
         // Bind the socket to the specified endpoint
         try std.posix.bind(fd, sockaddr_ptr, socklen);
         try std.posix.listen(fd, 0);
-        return .{ .fd = fd, .exit_fn = exit_fn };
+        return .{ .fd = fd };
     }
 
     /// Connect to a server by endpoint.
     pub fn connect(
         /// Remote endpoint to be connected.
         endpoint: Endpoint,
-        exit_fn: ?*const fn () anyerror!void,
-    ) anyerror!Socket {
+        /// Custom function to interrupt the connect process.
+        interrupt_fn: ?*const fn () anyerror!void,
+        /// Time, in milliseconds, to wait for the connection to establish.
+        /// 0 return `error.ConnectionTimedOut` if the connection is not
+        /// established instantly. Providing value less than 0 means infinite
+        /// timeout.
+        timeout: u64,
+    ) Error!Socket {
         // Have to return any error due to the nature of the `exit_fn`
         const sockaddr = endpoint.toSockAddr();
-        const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix.socklen_t =
+        const sockaddr_ptr: *const std.posix.sockaddr, const socklen: std.posix
+            .socklen_t =
             switch (sockaddr) {
-                .ipv4 => |in| .{ @ptrCast(@alignCast(&in)), @sizeOf(@TypeOf(in)) },
-                .ipv6 => |in6| .{ @ptrCast(@alignCast(&in6)), @sizeOf(@TypeOf(in6)) },
+                .ipv4 => |in| .{
+                    @ptrCast(@alignCast(&in)),
+                    @sizeOf(@TypeOf(in)),
+                },
+                .ipv6 => |in6| .{
+                    @ptrCast(@alignCast(&in6)),
+                    @sizeOf(@TypeOf(in6)),
+                },
             };
-        // Create a socket
+        // Create a nonblocking socket.
         const fd = try std.posix.socket(
             sockaddr_ptr.family,
             std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
             std.posix.IPPROTO.TCP,
         );
         errdefer std.posix.close(fd);
-        const socket: Socket = .{ .fd = fd, .exit_fn = exit_fn };
-        std.posix.connect(socket.fd, sockaddr_ptr, socklen) catch |e| switch (e) {
-            std.posix.ConnectError.WouldBlock => {
-                // Wait until the socket is ready to write.
-                const timeout = 3000; // Connection timeout after 3 s.
-                var timer = try std.time.Timer.start();
-                while (readyToWrite(socket.fd, 0)) |ready| {
-                    if (timer.read() / std.time.ns_per_ms > timeout)
-                        return std.posix.ConnectError.ConnectionTimedOut;
-                    if (exit_fn) |exit|
-                        exit() catch |err| return err;
-                    if (ready) break;
-                } else |err| return err;
-                var opt: [@sizeOf(u32)]u8 = undefined;
-                var len: i32 = @intCast(opt.len);
-                switch (builtin.os.tag) {
-                    .windows => {
-                        // Check whether the connect has completed successfully.
-                        // source:
-                        // https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-connect
+        const socket: Socket = .{ .fd = fd };
+        std.posix.connect(socket.fd, sockaddr_ptr, socklen) catch |e|
+            switch (e) {
+                std.posix.ConnectError.WouldBlock => {
+                    // Wait until the socket is ready to write.
+                    var timer = std.time.Timer.start() catch
                         {
-                            const res = std.os.windows.ws2_32.getsockopt(
-                                socket.fd,
-                                std.os.windows.ws2_32.SOL.SOCKET,
-                                std.os.windows.ws2_32.SO.ERROR,
-                                &opt,
-                                &len,
-                            );
-                            if (res != 0)
-                                return switch (std.os.windows.ws2_32.WSAGetLastError()) {
-                                    .WSANOTINITIALISED => error.NetworkUnitialised,
-                                    .WSAENETDOWN => error.NetworkSubsystemFailed,
-                                    .WSAEFAULT, .WSAENOPROTOOPT => error.InvalidOpt,
-                                    .WSAEINPROGRESS, .WSAENOTSOCK => unreachable,
-                                    .WSAEINVAL => error.InvalidLevel,
-                                    else => unreachable,
-                                };
-                        }
-                        // Reset the socket mode back to blocking
-                        {
-                            var ioctl_arg: u32 = 0;
-                            const res = std.os.windows.ws2_32.ioctlsocket(
-                                socket.fd,
-                                std.os.windows.ws2_32.FIONBIO,
-                                &ioctl_arg,
-                            );
-                            if (res != 0)
-                                return switch (std.os.windows.ws2_32.WSAGetLastError()) {
-                                    .WSANOTINITIALISED => error.NetworkUnitialised,
-                                    .WSAENETDOWN => error.NetworkSubsystemFailed,
-                                    .WSAEFAULT, .WSAENOPROTOOPT => error.InvalidArgument,
-                                    .WSAEINPROGRESS => error.ProgressingBlockingSocket,
-                                    .WSAENOTSOCK => unreachable,
-                                    else => unreachable,
-                                };
-                        }
-                    },
-                    .linux, .macos => {
-                        // Check whether the connect has completed successfully.
-                        // source:
-                        // https://man7.org/linux/man-pages/man2/connect.2.html
-                        try std.posix.getsockopt(
-                            socket.fd,
-                            std.posix.SOL.SOCKET,
-                            std.posix.SO.ERROR,
-                            &opt,
-                        );
-                        // Reset the socket mode back to blocking
-                        const flags =
-                            try std.posix.fcntl(socket.fd, std.posix.F.GETFL, 0);
-                        const new_flags = flags & ~@as(usize, std.posix.SOCK.NONBLOCK);
-                        _ = try std.posix.fcntl(socket.fd, std.posix.F.SETFL, new_flags);
-                    },
-                    // Need to be checked further other OS that posix compliant
-                    else => return error.UnsopportedOS,
-                }
-            },
-            else => return e,
-        };
+                            @branchHint(.unlikely);
+                            @panic("TimerUnsupported");
+                        };
+                    const pollfd: std.posix.pollfd = .{
+                        .fd = fd,
+                        .events = std.posix.POLL.OUT,
+                        .revents = 0,
+                    };
+                    var pollfds: [1]std.posix.pollfd = .{pollfd};
+                    while (true) {
+                        if (timer.read() / std.time.ns_per_ms > timeout)
+                            return std.posix.ConnectError.ConnectionTimedOut;
+                        if (interrupt_fn) |interrupt| interrupt() catch
+                            return Error.InterruptedByLocal;
+                        _ = try std.posix.poll(&pollfds, 0);
+                        // Socket ready to write. Connection established.
+                        if (pollfds[0].revents & std.posix.POLL.OUT ==
+                            std.posix.POLL.OUT) break;
+                        // Connection was reset by peer before connect could
+                        // complete.
+                        if (pollfds[0].revents & std.posix.POLL.HUP ==
+                            std.posix.POLL.HUP)
+                            return std.posix.ConnectError.ConnectionResetByPeer;
+                    }
+                },
+                else => return e,
+            };
         return socket;
     }
 
@@ -635,46 +945,33 @@ pub const Socket = struct {
     /// is released before the function returns.
     pub fn connectToHost(
         allocator: std.mem.Allocator,
+        /// The host name of the server.
         name: []const u8,
+        /// Port of the host.
         port: u16,
-        exit_fn: ?*const fn () anyerror!void,
-    ) anyerror!Socket {
-        const list = try std.net.getAddressList(allocator, name, port);
+        /// Custom function to interrupt the connect process.
+        interrupt_fn: ?*const fn () anyerror!void,
+        /// Time, in milliseconds, to wait for the connection of each found
+        /// endpoint to establish. 0 return `error.ConnectionTimedOut` if the
+        /// connection is not established instantly. Providing value less than 0
+        /// means infinite timeout.
+        timeout: u64,
+    ) (Error || Endpoint.Error)!Socket {
+        const list = std.net.getAddressList(allocator, name, port) catch
+            return error.UnknownHostName;
         defer list.deinit();
 
         if (list.addrs.len == 0) return error.UnknownHostName;
         var err: (std.posix.ConnectError || Error) = undefined;
         for (list.addrs) |addr| {
             const endpoint = try Endpoint.fromSockAddr(&addr.any);
-            return Socket.connect(endpoint, exit_fn) catch |e| {
-                switch (e) {
-                    // These 3 errors are allowed to attempt reconnect by
-                    // windows. With that allowance, instead of returning error,
-                    // continue the next endpoint.
-                    // see: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-connect
-                    std.posix.ConnectError.ConnectionRefused => {
-                        err = std.posix.ConnectError.ConnectionRefused;
-                        continue;
-                    },
-                    std.posix.ConnectError.ConnectionTimedOut => {
-                        err = std.posix.ConnectError.ConnectionTimedOut;
-                        continue;
-                    },
-                    std.posix.ConnectError.NetworkUnreachable => {
-                        err = std.posix.ConnectError.NetworkUnreachable;
-                        continue;
-                    },
-                    // This error is returned if attempting to connect to an IP
-                    // but the server has not listen to the IP.
-                    Error.ConnectionClosedByPeer => {
-                        err = Error.ConnectionClosedByPeer;
-                        continue;
-                    },
-                    else => return e,
-                }
+            return Socket.connect(endpoint, interrupt_fn, timeout) catch |e| {
+                // Save the latest error. Continue to the next endpoint.
+                err = e;
+                continue;
             };
         }
-        // Return the latest `ConnectError` catched from the last endpoint.
+        // Return the latest error catched from the last endpoint.
         return err;
     }
 
@@ -684,8 +981,7 @@ pub const Socket = struct {
 
     pub fn accept(
         self: Socket,
-        exit_fn: ?*const fn () anyerror!void,
-    ) std.posix.AcceptError!Socket {
+    ) Error!Socket {
         var accepted_addr: std.posix.sockaddr.storage = undefined;
         var addr_size: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
         const accepted_addr_ptr: *std.posix.sockaddr = @ptrCast(&accepted_addr);
@@ -693,22 +989,26 @@ pub const Socket = struct {
             self.fd,
             accepted_addr_ptr,
             &addr_size,
-            0,
+            std.posix.SOCK.NONBLOCK,
         );
-        return .{ .fd = fd, .exit_fn = exit_fn };
+        return .{ .fd = fd };
     }
 
-    pub fn getLocalEndPoint(self: Socket) !Endpoint {
+    pub fn getLocalEndPoint(self: Socket) (Endpoint.Error ||
+        std.posix.GetSockNameError)!Endpoint {
         var sockaddr: std.posix.sockaddr.storage = undefined;
-        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        var sockaddr_len: std.posix.socklen_t =
+            @sizeOf(std.posix.sockaddr.storage);
         const sockaddr_ptr: *std.posix.sockaddr = @ptrCast(&sockaddr);
         try std.posix.getsockname(self.fd, sockaddr_ptr, &sockaddr_len);
         return try Endpoint.fromSockAddr(sockaddr_ptr);
     }
 
-    pub fn getRemoteEndPoint(self: Socket) !Endpoint {
+    pub fn getRemoteEndPoint(self: Socket) (Endpoint.Error ||
+        std.posix.GetSockNameError)!Endpoint {
         var sockaddr: std.posix.sockaddr.storage = undefined;
-        var sockaddr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        var sockaddr_len: std.posix.socklen_t =
+            @sizeOf(std.posix.sockaddr.storage);
         const sockaddr_ptr: *std.posix.sockaddr = @ptrCast(&sockaddr);
         try std.posix.getpeername(self.fd, sockaddr_ptr, &sockaddr_len);
         return try Endpoint.fromSockAddr(sockaddr_ptr);
@@ -728,89 +1028,7 @@ pub const Socket = struct {
     /// to ensure the socket is ready to write.
     pub fn writer(self: Socket, buffer: []u8) Writer {
         // Falls back to std.net.Stream.Writer. No necessity to write own Writer.
-        return std.net.Stream.Writer.init(
-            .{ .handle = self.fd },
-            buffer,
-        );
-    }
-
-    // TODO: If zig support adding declaration in comptime, move this function
-    //       to the Reader.
-    /// Wait the socket until it is ready to read. If exit function is given,
-    /// this execute the function and exit from this function if the exit function
-    /// return error.
-    pub fn waitToRead(self: Socket) anyerror!void {
-        while (readyToRead(self.fd, 0)) |ready| {
-            if (self.exit_fn) |exit|
-                exit() catch |e| return e;
-            if (ready) return;
-        } else |e| return e;
-    }
-
-    // TODO: If zig support adding declaration in comptime, move this function
-    //       to the Writer.
-    /// Wait the socket until it is ready to write. If exit function is given,
-    /// this execute the function and exit from this function if the exit function
-    /// return error.
-    pub fn waitToWrite(self: Socket) anyerror!void {
-        while (readyToWrite(self.fd, 0)) |ready| {
-            if (self.exit_fn) |exit|
-                exit() catch |e| return e;
-            if (ready) return;
-        } else |e| return e;
-    }
-
-    // TODO: If zig support adding declaration in comptime, move this function
-    //       to the Reader.
-    /// Check if the socket is ready to read.
-    pub fn readyToRead(
-        fd: std.posix.socket_t,
-        /// Time, in milliseconds, to wait. 0 return immediately. <0 blocking.
-        timeout: i32,
-    ) (std.posix.PollError || Error)!bool {
-        const revents = try poll(fd, std.posix.POLL.RDNORM, timeout);
-
-        if (checkRevents(revents, std.posix.POLL.HUP))
-            return Error.ConnectionClosedByPeer;
-        return checkRevents(revents, std.posix.POLL.RDNORM);
-    }
-
-    // TODO: If zig support adding declaration in comptime, move this function
-    //       to the Writer.
-    /// Check if the socket is ready to write.
-    pub fn readyToWrite(
-        fd: std.posix.socket_t,
-        /// Time, in milliseconds, to wait. 0 return immediately. <0 blocking.
-        timeout: i32,
-    ) (std.posix.PollError || error{ConnectionClosedByPeer})!bool {
-        const revents = try poll(fd, std.posix.POLL.OUT, timeout);
-        if (checkRevents(revents, std.posix.POLL.HUP))
-            return error.ConnectionClosedByPeer;
-        return checkRevents(revents, std.posix.POLL.OUT);
-    }
-
-    fn checkRevents(revents: i16, mask: i16) bool {
-        if (revents & mask == mask) return true else return false;
-    }
-
-    /// Query the socket status with the given event, return the revent.
-    /// Note that `POLLHUP`, `POLLNVAL`, and `POLLERR` is always returned
-    /// without any request.
-    fn poll(
-        socket: std.posix.socket_t,
-        events: i16,
-        /// Time, in milliseconds, to wait. 0 return immediately. <0 blocking.
-        timeout: i32,
-    ) std.posix.PollError!i16 {
-        const fd: std.posix.pollfd = .{
-            .fd = socket,
-            .events = events,
-            .revents = 0,
-        };
-        var poll_fd: [1]std.posix.pollfd = .{fd};
-        // check whether the expected socket event happen
-        _ = try std.posix.poll(&poll_fd, timeout);
-        return poll_fd[0].revents;
+        return Writer.init(self.fd, buffer);
     }
 };
 
